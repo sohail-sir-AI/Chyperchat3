@@ -1,71 +1,101 @@
-import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getFirestore } from 'firebase/firestore';
-import { getAuth, signInWithPopup, GoogleAuthProvider, signOut } from 'firebase/auth';
-import config from '../../firebase-applet-config.json';
-
-const firebaseConfig = {
-  apiKey: config.apiKey,
-  authDomain: config.authDomain,
-  projectId: config.projectId,
-  storageBucket: config.storageBucket,
-  messagingSenderId: config.messagingSenderId,
-  appId: config.appId
-};
+import { initializeApp } from 'firebase/app';
+import { getAuth, GoogleAuthProvider, signInWithPopup, signOut } from 'firebase/auth';
+import { initializeFirestore, persistentLocalCache, persistentMultipleTabManager, doc, getDocFromServer } from 'firebase/firestore';
+import firebaseConfig from '../../firebase-applet-config.json';
 
 // Initialize Firebase
-const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
-
-// Initialize Firestore & Auth
-export const db = getFirestore(app);
+const app = initializeApp(firebaseConfig);
+export const db = initializeFirestore(app, {
+  localCache: persistentLocalCache({
+    tabManager: persistentMultipleTabManager()
+  })
+}, firebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
+export const googleProvider = new GoogleAuthProvider();
 
-// Export operation types
+// Error Handling Infrastructure conforming to FirestoreErrorInfo
 export enum OperationType {
-  CREATE = 'CREATE',
-  READ = 'READ',
-  UPDATE = 'UPDATE',
-  DELETE = 'DELETE',
-  LIST = 'LIST'
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
 }
 
-// Error handler utility
-export function handleFirestoreError(error: any, operation: OperationType, resource: string) {
-  console.error(`Error during ${operation} on ${resource}:`, error);
-  
-  if (error.code === 'permission-denied') {
-    console.error('Permission denied. Check Firestore security rules.');
-  } else if (error.code === 'not-found') {
-    console.error(`Resource not found: ${resource}`);
-  } else if (error.code === 'already-exists') {
-    console.error(`Resource already exists: ${resource}`);
+export interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      email?: string | null;
+    }[];
+  };
+}
+
+export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null): never {
+  const errCode = (error as any)?.code;
+  const errMessage = error instanceof Error ? error.message : String(error);
+
+  const errInfo: FirestoreErrorInfo = {
+    error: errMessage,
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData?.map(provider => ({
+        providerId: provider.providerId,
+        email: provider.email,
+      })) || []
+    },
+    operationType,
+    path
+  };
+
+  if (errCode === 'unavailable' || errMessage.includes('Could not reach Cloud Firestore backend')) {
+    console.warn('Cloud Firestore network connection unavailable. Operating in offline cache mode:', errMessage);
   } else {
-    console.error(`Firestore error: ${error.message}`);
+    console.error('Firestore Secure Error Info:', JSON.stringify(errInfo, null, 2));
+  }
+
+  throw new Error(JSON.stringify(errInfo));
+}
+
+// Connection validation
+export async function testConnection() {
+  try {
+    await getDocFromServer(doc(db, 'test', 'connection'));
+  } catch (error: any) {
+    if (error instanceof Error && error.message.includes('the client is offline')) {
+      console.error("Please check your Firebase configuration or network connection.");
+    }
   }
 }
 
-// Google Sign-In
+// Authentication Helpers
 export async function signInWithGoogle() {
   try {
-    const provider = new GoogleAuthProvider();
-    provider.addScope('profile');
-    provider.addScope('email');
-    
-    const result = await signInWithPopup(auth, provider);
+    const result = await signInWithPopup(auth, googleProvider);
     return result.user;
   } catch (error) {
-    console.error('Google sign-in failed:', error);
+    console.error('Error signing in with Google:', error);
     throw error;
   }
 }
 
-// Sign Out
 export async function logOut() {
   try {
     await signOut(auth);
   } catch (error) {
-    console.error('Sign out failed:', error);
-    throw error;
+    console.error('Error signing out:', error);
   }
 }
-
-export default app;
