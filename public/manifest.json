@@ -1,0 +1,18 @@
+{
+  "short_name": "CypherChat",
+  "name": "CypherChat - Encrypted Messaging",
+  "description": "End-to-End client-side encrypted messaging web application with real-time status.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><rect width='512' height='512' rx='128' fill='%230f172a'/><path d='M256 120c-75 0-136 61-136 136 0 35 13 67 36 91l-24 53 61-19c19 10 41 15 63 15 75 0 136-61 136-136S331 120 256 120z' fill='%2310b981'/></svg>",
+      "sizes": "512x512 192x192 128x128",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
