@@ -1,0 +1,6 @@
+{
+  "name": "CypherChat",
+  "description": "End-to-End client-side encrypted messaging web application with real-time online status heartbeat checking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

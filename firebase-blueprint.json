@@ -1,0 +1,154 @@
+{
+  "entities": {
+    "user": {
+      "title": "User Profile",
+      "description": "Public profile and online status for a chat user.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "The Firebase Authentication UID of the user."
+        },
+        "displayName": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "User's display name."
+        },
+        "photoURL": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "URL to the user's avatar."
+        },
+        "email": {
+          "type": "string",
+          "maxLength": 254,
+          "description": "User's email address."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["online", "offline"],
+          "description": "The current presence status of the user."
+        },
+        "lastSeen": {
+          "type": "string",
+          "format": "date-time",
+          "description": "The last timestamp when the user was verified active."
+        }
+      },
+      "required": ["uid", "displayName", "email", "status", "lastSeen"]
+    },
+    "chat": {
+      "title": "Chat Room",
+      "description": "A conversation between two or more users.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique chat room identifier."
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Optional name for group chats."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["direct", "group"],
+          "description": "Whether this is a 1-to-1 direct message or a group chat."
+        },
+        "participantIds": {
+          "type": "array",
+          "description": "List of user UIDs participating in this chat."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when the chat room was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when the chat room was last updated."
+        },
+        "lastMessage": {
+          "type": "object",
+          "description": "Data about the last message sent in this chat room."
+        },
+        "isTyping": {
+          "type": "object",
+          "description": "Map of user UIDs to booleans indicating who is actively typing."
+        }
+      },
+      "required": ["id", "type", "participantIds", "createdAt", "updatedAt"]
+    },
+    "message": {
+      "title": "Message",
+      "description": "A single text or encrypted message within a chat room.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique message identifier."
+        },
+        "senderId": {
+          "type": "string",
+          "description": "UID of the message sender."
+        },
+        "senderName": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Display name of the message sender."
+        },
+        "senderPhoto": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Avatar image URL of the message sender."
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when the message was sent."
+        },
+        "isEncrypted": {
+          "type": "boolean",
+          "description": "Flag indicating if the message payload is end-to-end encrypted."
+        },
+        "ciphertext": {
+          "type": "string",
+          "maxLength": 10000,
+          "description": "Base64 encoded ciphertext payload."
+        },
+        "iv": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Base64 encoded initialization vector for decryption."
+        },
+        "salt": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Base64 encoded salt used for PBKDF2 key derivation."
+        },
+        "previewText": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "Unencrypted placeholder text (e.g. '🔒 Encrypted Message') for safe previews."
+        }
+      },
+      "required": ["id", "senderId", "senderName", "timestamp", "isEncrypted", "ciphertext", "iv", "salt", "previewText"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "user",
+      "description": "Lookup table for user profile information and online status heartbeat."
+    },
+    "/chats/{chatId}": {
+      "schema": "chat",
+      "description": "Main list of active chats/dialogues."
+    },
+    "/chats/{chatId}/messages/{messageId}": {
+      "schema": "message",
+      "description": "Subcollection containing the sequence of messages for a specific chat."
+    }
+  }
+}

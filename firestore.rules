@@ -1,0 +1,142 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // 1. Global Safety Net - default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Reusable global helper primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn();
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128;
+    }
+
+    // Helper to retrieve the parent chat data
+    function getChatData(chatId) {
+      return get(/databases/$(database)/documents/chats/$(chatId)).data;
+    }
+
+    // Check if a specific user is in the participants list of a chat
+    function isChatParticipant(chatId, userId) {
+      return userId in getChatData(chatId).participantIds;
+    }
+
+    // Strict schema validator for User Profile
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'displayName', 'photoURL', 'email', 'status', 'lastSeen'])
+        && data.keys().size() == 6
+        && data.uid == request.auth.uid
+        && data.displayName is string && data.displayName.size() > 0 && data.displayName.size() <= 100
+        && data.photoURL is string && data.photoURL.size() <= 500
+        && data.email is string && data.email.size() > 0 && data.email.size() <= 254
+        && (data.status == 'online' || data.status == 'offline')
+        && data.lastSeen is timestamp && data.lastSeen <= request.time;
+    }
+
+    // Strict schema validator for Chat Room
+    // Allows optional fields name, lastMessage and isTyping (5 to 8 keys)
+    function isValidChat(data) {
+      return data.keys().hasAll(['id', 'type', 'participantIds', 'createdAt', 'updatedAt'])
+        && data.keys().size() >= 5 && data.keys().size() <= 8
+        && data.id is string && data.id.size() > 0 && data.id.size() <= 128
+        && (data.type == 'direct' || data.type == 'group')
+        && data.participantIds is list && data.participantIds.size() >= 1 && data.participantIds.size() <= 10
+        && data.participantIds[0] is string
+        && data.updatedAt is timestamp && data.updatedAt <= request.time
+        && (!data.keys().hasAny(['name']) || (data.name is string && data.name.size() <= 100))
+        && (!data.keys().hasAny(['lastMessage']) || (data.lastMessage is map))
+        && (!data.keys().hasAny(['isTyping']) || (data.isTyping is map));
+    }
+
+    // Strict schema validator for Messages (Immutable payloads with size bounds)
+    function isValidMessage(data) {
+      return data.keys().hasAll(['id', 'senderId', 'senderName', 'senderPhoto', 'timestamp', 'isEncrypted', 'ciphertext', 'iv', 'salt', 'previewText', 'readBy', 'isRead'])
+        && data.keys().size() == 12
+        && data.id is string && data.id.size() > 0 && data.id.size() <= 128
+        && data.senderId == request.auth.uid
+        && data.senderName is string && data.senderName.size() <= 100
+        && data.senderPhoto is string && data.senderPhoto.size() <= 500
+        && data.timestamp is timestamp && data.timestamp <= request.time
+        && data.isEncrypted is bool
+        && data.ciphertext is string && data.ciphertext.size() <= 10000
+        && data.iv is string && data.iv.size() <= 128
+        && data.salt is string && data.salt.size() <= 128
+        && data.previewText is string && data.previewText.size() <= 200
+        && data.readBy is list
+        && data.isRead is bool;
+    }
+
+    // --- COLLECTION RULES ---
+
+    // 1. Users Collection
+    match /users/{userId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn(); // Directory lookup for listing contacts
+      
+      allow create: if isVerifiedUser() 
+        && userId == request.auth.uid 
+        && isValidUser(request.resource.data);
+        
+      allow update: if isVerifiedUser() 
+        && userId == request.auth.uid 
+        && isValidUser(request.resource.data)
+        && request.resource.data.email == resource.data.email; // email is immutable
+    }
+
+    // 2. Chats Collection
+    match /chats/{chatId} {
+      allow get: if isSignedIn() && request.auth.uid in resource.data.participantIds;
+      // List checks resource.data directly to prevent scraping other users' rooms (Query Enforcer)
+      allow list: if isSignedIn() && request.auth.uid in resource.data.participantIds;
+
+      allow create: if isVerifiedUser() && isValidId(chatId)
+        && request.auth.uid in request.resource.data.participantIds
+        && isValidChat(request.resource.data)
+        && request.resource.data.createdAt is timestamp && request.resource.data.createdAt <= request.time;
+
+      allow update: if isVerifiedUser() && isValidId(chatId)
+        && request.auth.uid in resource.data.participantIds
+        && request.auth.uid in request.resource.data.participantIds
+        && isValidChat(request.resource.data)
+        && request.resource.data.createdAt == resource.data.createdAt // createdAt is immutable
+        && (
+          // Action 1: Silent update to update last message state (e.g. when adding a message)
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastMessage', 'updatedAt'])
+          ||
+          // Action 2: Standard group configuration updates (name, participantIds list size up to 10)
+          request.resource.data.diff(resource.data).affectedKeys().hasAny(['participantIds', 'name', 'updatedAt'])
+          ||
+          // Action 3: Real-time typing status update
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isTyping'])
+        );
+    }
+
+    // 3. Messages Sub-collection
+    match /chats/{chatId}/messages/{messageId} {
+      // Access requires user to be a participant of the parent chat
+      allow get: if isSignedIn() && isChatParticipant(chatId, request.auth.uid);
+      allow list: if isSignedIn() && isChatParticipant(chatId, request.auth.uid);
+
+      allow create: if isVerifiedUser() && isValidId(messageId)
+        && isChatParticipant(chatId, request.auth.uid)
+        && isValidMessage(request.resource.data);
+
+      allow update: if isVerifiedUser() && isValidId(messageId)
+        && isChatParticipant(chatId, request.auth.uid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readBy', 'isRead'])
+        && request.auth.uid in request.resource.data.readBy
+        && request.resource.data.readBy.hasAll(resource.data.get('readBy', []));
+
+      allow delete: if false;
+    }
+  }
+}
