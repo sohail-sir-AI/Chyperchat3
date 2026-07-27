@@ -7,34 +7,109 @@ service cloud.firestore {
       return request.auth != null;
     }
 
-    function isOwner(userId) {
-      return isAuthenticated() && request.auth.uid == userId;
+    function isVerifiedUser() {
+      return isAuthenticated() && (
+        request.auth.token.email_verified == true ||
+        request.auth.provider_id == 'anonymous' ||
+        request.auth.token.firebase.sign_in_provider == 'google.com'
+      );
     }
 
-    function isVerifiedUser() {
-      return isAuthenticated() && request.auth.token.email_verified == true;
+    function isUser(userId) {
+      return isVerifiedUser() && request.auth.uid == userId;
     }
 
     function isChatParticipant(chatId, userId) {
-      return isAuthenticated() && userId in get(/databases/$(database)/documents/chats/$(chatId)).data.participantIds;
+      return isVerifiedUser() && (
+        userId in get(/databases/$(database)/documents/chats/$(chatId)).data.participantIds
+      );
     }
 
     // Strict schema validator for User Profiles
     function isValidUserProfile(data) {
-      return data.keys().hasAll(['uid', 'email', 'displayName', 'photoURL', 'status', 'lastSeen'])
-        && data.keys().size() <= 7
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'photoURL', 'createdAt', 'lastSeen', 'status'])
+        && data.keys().size() <= 10
         && data.uid == request.auth.uid
         && data.email is string
         && data.displayName is string && data.displayName.size() <= 100
         && data.photoURL is string && data.photoURL.size() <= 500
-        && data.status in ['online', 'offline', 'away']
-        && data.lastSeen is timestamp;
+        && data.createdAt is timestamp
+        && data.lastSeen is timestamp
+        && data.status in ['online', 'offline', 'away'];
+    }
+
+    // User Directory Security
+    match /users/{userId} {
+      allow read: if isVerifiedUser();
+      allow create, update: if isUser(userId) && isValidUserProfile(request.resource.data);
+      allow delete: if false;
     }
 
     // Strict schema validator for Chat Rooms
     function isValidChatRoom(data) {
-      return data.keys().hasAll(['id', 'participantIds', 'createdAt', 'updatedAt', 'lastMessage'])
-        && data.keys().size() <= 7
+      return data.keys().hasAll(['id', 'participantIds', 'createdAt', 'updatedAt', 'type'])
+        && data.keys().size() <= 10
+        && data.id is string
+        && data.participantIds is list
+        && data.participantIds.size() >= 1
+        && data.participantIds.size() <= 10
+        && request.auth.uid in data.participantIds
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp
+        && data.type in ['direct', 'group'];
+    }
+
+    // Chat Rooms Security
+    match /chats/{chatId} {
+      allow read: if isVerifiedUser() && request.auth.uid in resource.data.participantIds;
+      allow create: if isVerifiedUser() && isValidChatRoom(request.resource.data);
+      
+      allow update: if isVerifiedUser() 
+        && request.auth.uid in resource.data.participantIds
+        && request.auth.uid in request.resource.data.participantIds;
+
+      allow delete: if false;
+
+      // Strict schema validator for Messages
+      function isValidMessage(data) {
+        return data.keys().hasAll(['id', 'senderId', 'senderName', 'senderPhoto', 'timestamp', 'isEncrypted', 'ciphertext', 'iv', 'salt', 'previewText', 'readBy', 'isRead'])
+          && data.keys().size() >= 12 && data.keys().size() <= 15
+          && data.id is string && data.id.size() > 0 && data.id.size() <= 128
+          && data.senderId == request.auth.uid
+          && data.senderName is string && data.senderName.size() <= 100
+          && data.senderPhoto is string && data.senderPhoto.size() <= 500
+          && data.timestamp is timestamp && data.timestamp <= request.time
+          && data.isEncrypted is bool
+          && data.ciphertext is string && data.ciphertext.size() <= 900000
+          && data.iv is string && data.iv.size() <= 128
+          && data.salt is string && data.salt.size() <= 128
+          && data.previewText is string && data.previewText.size() <= 200
+          && data.readBy is list
+          && data.readBy.size() <= 20
+          && data.isRead is bool;
+      }
+
+      // Chat Messages Security
+      match /messages/{messageId} {
+        allow read: if isVerifiedUser() && isChatParticipant(chatId, request.auth.uid);
+        
+        allow create: if isVerifiedUser() 
+          && isChatParticipant(chatId, request.auth.uid)
+          && isValidMessage(request.resource.data);
+
+        allow update: if isVerifiedUser()
+          && isChatParticipant(chatId, request.auth.uid)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readBy', 'isRead'])
+          && request.auth.uid in request.resource.data.readBy
+          && request.resource.data.readBy.hasAll(resource.data.get('readBy', []));
+
+        allow delete: if isVerifiedUser() 
+          && isChatParticipant(chatId, request.auth.uid)
+          && resource.data.senderId == request.auth.uid;
+      }
+    }
+  }
+}        && data.keys().size() <= 7
         && data.id is string
         && data.participantIds is list && data.participantIds.size() >= 2 && data.participantIds.size() <= 10
         && request.auth.uid in data.participantIds
