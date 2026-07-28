@@ -53,46 +53,4 @@ export default function PresenceStatus({ user, showText = false, showDetails = f
       )}
     </div>
   );
-}          }`}
-        />
-      </div>
-
-      {showText && (
-        <div className="flex flex-col">
-          <span className="text-xs font-semibold text-slate-200">{user.displayName}</span>
-          <span className="text-[10px] text-slate-400">
-            {online ? (
-              <span className="text-emerald-400 font-medium">Online</span>
-            ) : (
-              `Last seen: ${formatRelativeTime(user.lastSeen)}`
-            )}
-          </span>
-        </div>
-      )}
-    </div>
-  );
-}        </div>
-      )}
-      {showText && !showDetails && (
-        <span className="text-xs text-slate-400 capitalize">{user.status}</span>
-      )}
-    </div>
-  );
-};        />
-      </div>
-
-      {showText && (
-        <div className="flex flex-col">
-          <span className="text-xs font-semibold text-slate-200">{user.displayName}</span>
-          <span className="text-[10px] text-slate-400">
-            {online ? (
-              <span className="text-emerald-400 font-medium">Online</span>
-            ) : (
-              `Last seen: ${formatRelativeTime(user.lastSeen)}`
-            )}
-          </span>
-        </div>
-      )}
-    </div>
-  );
 }
