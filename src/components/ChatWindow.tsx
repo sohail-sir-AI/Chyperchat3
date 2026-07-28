@@ -1,40 +1,737 @@
+// File Path: src/components/ChatWindow.tsx
+
 import React, { useState, useEffect, useRef } from 'react';
-import {
-  collection,
-  query,
-  orderBy,
-  onSnapshot,
-  doc,
-  setDoc,
-  updateDoc,
-  deleteDoc,
-  serverTimestamp,
-  writeBatch,
-  arrayUnion
+import { 
+  collection, 
+  addDoc, 
+  query, 
+  orderBy, 
+  onSnapshot, 
+  serverTimestamp, 
+  doc, 
+  updateDoc, 
+  arrayUnion,
+  writeBatch
 } from 'firebase/firestore';
-import {
-  Shield,
-  ShieldAlert,
-  ShieldCheck,
-  Send,
-  Key,
-  Lock,
-  Unlock,
+import { 
+  Send, 
+  Lock, 
+  Key, 
+  Clock, 
+  ShieldCheck, 
+  Image as ImageIcon, 
+  X, 
+  Check, 
+  CheckCheck, 
+  CornerUpLeft, 
+  Trash2, 
+  Info, 
+  ChevronLeft,
   Eye,
   EyeOff,
-  ArrowLeft,
-  Check,
-  CheckCheck,
-  CornerUpLeft,
-  Trash2,
-  X,
-  Image as ImageIcon,
-  Maximize2,
-  Download,
+  AlertCircle,
   Loader2
 } from 'lucide-react';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
-import { encryptMessage, decryptMessage, EncryptedPayload } from '../lib/crypto';
+import { encryptMessage, decryptMessage, EncryptedPayload, getPasscodeFingerprint } from '../lib/crypto';
+import { processImageFile } from '../lib/imageUtils';
+import { formatMessageTime, formatRelativeTime } from '../lib/dateUtils';
+import { ChatRoom, ChatMessage, UserProfile } from '../types';
+import PresenceStatus from './PresenceStatus';
+
+interface ChatWindowProps {
+  chat: ChatRoom;
+  currentUser: UserProfile;
+  usersMap: Record<string, UserProfile>;
+  onEmergencyLock: () => void;
+  onBack: () => void;
+}
+
+export default function ChatWindow({
+  chat,
+  currentUser,
+  usersMap,
+  onEmergencyLock,
+  onBack
+}: ChatWindowProps) {
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [inputText, setInputText] = useState('');
+  const [decryptedTexts, setDecryptedTexts] = useState<Record<string, string>>({});
+  
+  // E2EE Passphrase state (Volatile memory only)
+  const [passphrase, setPassphrase] = useState('');
+  const [tempPassphrase, setTempPassphrase] = useState('');
+  const [showTempPassphrase, setShowTempPassphrase] = useState(false);
+  const [showKeypad, setShowKeypad] = useState(true);
+  const [keyFingerprint, setKeyFingerprint] = useState('');
+
+  // Compute key verification fingerprint (SHA-256) when active passphrase changes
+  useEffect(() => {
+    if (!passphrase) {
+      setKeyFingerprint('');
+      return;
+    }
+    getPasscodeFingerprint(passphrase).then(fp => setKeyFingerprint(fp));
+  }, [passphrase]);
+
+  const [replyingTo, setReplyingTo] = useState<{ id: string; senderName: string; text: string } | null>(null);
+  
+  // Media / Attachment states
+  const [selectedImage, setSelectedImage] = useState<File | null>(null);
+  const [imagePreview, setImagePreview] = useState<string | null>(null);
+  const [ephemeralHours, setEphemeralHours] = useState<number>(0); // 0 = off
+
+  // Status & Error indicators
+  const [errorMsg, setErrorMsg] = useState('');
+  const [isSending, setIsSending] = useState(false);
+  const [decryptionStatus, setDecryptionStatus] = useState<'idle' | 'success' | 'failed'>('idle');
+
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Auto scroll to bottom
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages, decryptedTexts]);
+
+  // 1. Subscribe to real-time messages & update read receipts
+  useEffect(() => {
+    if (!chat.id) return;
+
+    const messagesPath = `chats/${chat.id}/messages`;
+    const q = query(
+      collection(db, messagesPath),
+      orderBy('timestamp', 'asc')
+    );
+
+    const unsubscribe = onSnapshot(
+      q,
+      (snapshot) => {
+        const msgList: ChatMessage[] = [];
+        const batch = writeBatch(db);
+        let hasUpdatesToRead = false;
+
+        snapshot.docs.forEach((d) => {
+          const data = d.data() as Omit<ChatMessage, 'id'>;
+          const msgObj: ChatMessage = { id: d.id, ...data };
+          msgList.push(msgObj);
+
+          // Mark message as read if current user hasn't marked it yet
+          if (currentUser?.uid && data.senderId !== currentUser.uid) {
+            const readBy = data.readBy || [];
+            if (!readBy.includes(currentUser.uid)) {
+              const msgRef = doc(db, messagesPath, d.id);
+              batch.update(msgRef, {
+                readBy: arrayUnion(currentUser.uid)
+              });
+              hasUpdatesToRead = true;
+            }
+          }
+        });
+
+        if (hasUpdatesToRead) {
+          batch.commit().catch((err) => {
+            console.error('Error updating read receipts:', err);
+          });
+        }
+
+        setMessages(msgList);
+      },
+      (error) => {
+        handleFirestoreError(error, OperationType.READ, messagesPath);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [chat.id, currentUser?.uid]);
+
+  // 2. Decrypt messages whenever passphrase or messages change
+  useEffect(() => {
+    if (!passphrase) {
+      setDecryptedTexts({});
+      setDecryptionStatus('idle');
+      return;
+    }
+
+    let failCount = 0;
+    let successCount = 0;
+    const newDecrypted: Record<string, string> = {};
+
+    const decryptAll = async () => {
+      for (const msg of messages) {
+        if (!msg.ciphertext || !msg.iv || !msg.mac) continue;
+
+        try {
+          const payload: EncryptedPayload = {
+            ciphertext: msg.ciphertext,
+            iv: msg.iv,
+            mac: msg.mac
+          };
+          const plainText = await decryptMessage(payload, passphrase);
+          newDecrypted[msg.id] = plainText;
+          successCount++;
+        } catch {
+          failCount++;
+        }
+      }
+
+      setDecryptedTexts(newDecrypted);
+      if (failCount > 0 && successCount === 0 && messages.length > 0) {
+        setDecryptionStatus('failed');
+      } else if (successCount > 0) {
+        setDecryptionStatus('success');
+      }
+    };
+
+    decryptAll();
+  }, [messages, passphrase]);
+
+  // Handle typing indicator updates
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setInputText(e.target.value);
+
+    if (!currentUser) return;
+
+    // Set typing = true
+    const chatRef = doc(db, 'chats', chat.id);
+    updateDoc(chatRef, {
+      [`typing.${currentUser.uid}`]: true
+    }).catch(() => {});
+
+    // Clear previous timeout
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+
+    // Stop typing after 2.5 seconds of inactivity
+    typingTimeoutRef.current = setTimeout(() => {
+      updateDoc(chatRef, {
+        [`typing.${currentUser.uid}`]: false
+      }).catch(() => {});
+    }, 2500);
+  };
+
+  // Image File selection
+  const handleImageSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      const file = e.target.files[0];
+      setSelectedImage(file);
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setImagePreview(reader.result as string);
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  // Clear selected image
+  const handleClearImage = () => {
+    setSelectedImage(null);
+    setImagePreview(null);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  // Send Encrypted Message
+  const handleSendMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+
+    if (!passphrase) {
+      setErrorMsg('Please set or apply an encryption passcode first!');
+      return;
+    }
+
+    if (!inputText.trim() && !selectedImage) return;
+
+    setIsSending(true);
+    setErrorMsg('');
+
+    try {
+      let processedBase64Image: string | undefined = undefined;
+
+      if (selectedImage) {
+        processedBase64Image = await processImageFile(selectedImage);
+      }
+
+      // Encrypt the message text
+      const textToEncrypt = inputText.trim() || '[Attached Image]';
+      const encrypted = await encryptMessage(textToEncrypt, passphrase);
+
+      let imageURL: string | undefined = undefined;
+      if (processedBase64Image) {
+        imageURL = processedBase64Image;
+      }
+
+      // Calculate expiration timestamp if ephemeral mode is active
+      let expiresAt = null;
+      if (ephemeralHours > 0) {
+        const now = new Date();
+        expiresAt = new Date(now.getTime() + ephemeralHours * 3600 * 1000);
+      }
+
+      const messagesPath = `chats/${chat.id}/messages`;
+      
+      const newMsgData: Omit<ChatMessage, 'id'> = {
+        senderId: currentUser.uid,
+        senderName: currentUser.displayName || 'Anonymous',
+        ciphertext: encrypted.ciphertext,
+        iv: encrypted.iv,
+        mac: encrypted.mac,
+        timestamp: serverTimestamp(),
+        readBy: [currentUser.uid],
+        ...(replyingTo && { replyTo: replyingTo }),
+        ...(imageURL && { imageURL }),
+        ...(ephemeralHours > 0 && { ephemeralHours, expiresAt })
+      };
+
+      await addDoc(collection(db, messagesPath), newMsgData);
+
+      // Update Chat Room's lastMessage
+      const chatRef = doc(db, 'chats', chat.id);
+      await updateDoc(chatRef, {
+        updatedAt: serverTimestamp(),
+        lastMessage: {
+          text: '[Encrypted Cypher Message]',
+          senderId: currentUser.uid,
+          timestamp: serverTimestamp()
+        },
+        [`typing.${currentUser.uid}`]: false
+      });
+
+      // Clear input state
+      setInputText('');
+      setReplyingTo(null);
+      handleClearImage();
+
+    } catch (err: any) {
+      console.error('Failed to send encrypted message:', err);
+      setErrorMsg(err.message || 'Error encrypting message. Check passcode.');
+    } finally {
+      setIsSending(false);
+    }
+  };
+
+  // Determine participant details for title bar
+  const otherParticipantId = chat.type === 'direct'
+    ? chat.participants.find(id => id !== currentUser.uid)
+    : null;
+  const otherUser = otherParticipantId ? usersMap[otherParticipantId] : null;
+
+  // Check if someone else is typing
+  const typingUsers = chat.typing
+    ? Object.entries(chat.typing)
+        .filter(([uid, isTyping]) => uid !== currentUser.uid && isTyping)
+        .map(([uid]) => usersMap[uid]?.displayName || 'Someone')
+    : [];
+
+  return (
+    <div className="flex flex-col h-full bg-slate-950 text-slate-100 relative overflow-hidden select-none">
+      
+      {/* Top Bar Header */}
+      <div className="flex items-center justify-between px-4 py-3 bg-slate-900/90 border-b border-slate-800 backdrop-blur-md z-20">
+        <div className="flex items-center gap-3 min-w-0">
+          <button
+            onClick={onBack}
+            className="md:hidden p-1.5 rounded-lg bg-slate-800 text-slate-400 hover:text-slate-100 transition-colors"
+          >
+            <ChevronLeft className="w-5 h-5" />
+          </button>
+
+          {chat.type === 'direct' && otherUser ? (
+            <PresenceStatus user={otherUser} showDetails={true} />
+          ) : (
+            <div className="flex items-center gap-2">
+              <div className="w-9 h-9 rounded-full bg-amber-500/20 border border-amber-500/30 flex items-center justify-center font-bold text-amber-400 text-sm">
+                {chat.name ? chat.name[0].toUpperCase() : 'G'}
+              </div>
+              <div>
+                <h3 className="font-semibold text-sm text-slate-100 leading-tight">{chat.name || 'Group Chat'}</h3>
+                <p className="text-[10px] text-slate-400">{chat.participants.length} members</p>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2">
+          {/* Emergency Lock / Panic Button */}
+          <button
+            onClick={onEmergencyLock}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-rose-950/80 border border-rose-500/40 text-rose-300 hover:bg-rose-900 transition-all text-xs font-semibold cursor-pointer shadow-lg shadow-rose-950/50"
+            title="Instant Panic Wipe - Clears key and exits chat"
+          >
+            <Lock className="w-3.5 h-3.5 text-rose-400 animate-pulse" />
+            <span className="hidden sm:inline">Emergency Lock</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Passcode & Keypad Security Vault Toolbar */}
+      <div className="bg-slate-900/95 border-b border-slate-800 p-3 z-10 flex flex-col gap-2.5">
+        <div className="flex items-center justify-between gap-2">
+          <div className="relative flex-1 max-w-sm">
+            <Key className="w-4 h-4 text-amber-400 absolute left-3 top-1/2 -translate-y-1/2" />
+            <input
+              type={showTempPassphrase ? "text" : "password"}
+              value={tempPassphrase}
+              onChange={(e) => setTempPassphrase(e.target.value)}
+              placeholder="Enter PIN or Custom Key..."
+              className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-9 pr-9 py-2 text-xs font-mono text-amber-300 placeholder-slate-600 focus:outline-none focus:border-amber-500 transition-colors"
+            />
+            <button
+              type="button"
+              onClick={() => setShowTempPassphrase(!showTempPassphrase)}
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300"
+            >
+              {showTempPassphrase ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+            </button>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => {
+              if (!tempPassphrase) {
+                setErrorMsg('Enter a key first!');
+                return;
+              }
+              setPassphrase(tempPassphrase);
+              setErrorMsg('');
+            }}
+            className="bg-amber-600 hover:bg-amber-500 text-slate-950 font-bold px-4 py-2 rounded-xl text-xs transition-colors cursor-pointer shrink-0 shadow-md shadow-amber-950/30"
+          >
+            Apply Key
+          </button>
+
+          {/* Lock Vault / Wipe Active Key Button */}
+          {passphrase && (
+            <button
+              type="button"
+              onClick={() => {
+                setPassphrase('');
+                setTempPassphrase('');
+                setErrorMsg('');
+              }}
+              className="bg-rose-950/80 hover:bg-rose-900 border border-rose-500/30 text-rose-300 font-semibold px-3 py-2 rounded-xl text-xs transition-all active:scale-95 cursor-pointer shrink-0 flex items-center gap-1"
+              title="Lock Vault: Instantly wipe active key from browser memory"
+            >
+              <Lock className="w-3.5 h-3.5 text-rose-400" />
+              <span>Lock Vault</span>
+            </button>
+          )}
+        </div>
+
+        {/* Security Info & Fingerprint Badge */}
+        <div className="flex flex-wrap items-center justify-between text-[11px] text-slate-400 px-0.5 gap-2">
+          {keyFingerprint ? (
+            <div className="flex items-center gap-1.5 bg-emerald-950/60 border border-emerald-500/30 text-emerald-300 px-2.5 py-1 rounded-lg font-mono">
+              <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Fingerprint: <strong>{keyFingerprint}</strong></span>
+              <span className="text-[10px] text-emerald-500 hidden sm:inline ml-1">(Both members check code to verify)</span>
+            </div>
+          ) : (
+            <span>Passcodes are strictly computed in browser memory (AES-GCM 256) and never sent to servers.</span>
+          )}
+
+          <button
+            type="button"
+            onClick={() => setShowKeypad(!showKeypad)}
+            className="text-amber-400 hover:text-amber-300 font-medium cursor-pointer flex items-center gap-1 ml-auto shrink-0 hover:underline"
+          >
+            <Key className="w-3.5 h-3.5" />
+            <span>{showKeypad ? 'Hide Keypad' : 'Keypad'}</span>
+          </button>
+        </div>
+
+        {/* PIN Pad Toggle Box */}
+        {showKeypad && (
+          <div className="bg-slate-950/90 border border-slate-800/80 rounded-xl p-3 flex flex-col items-center">
+            <div className="w-full text-center mb-2">
+              <span className="text-[10px] font-mono text-amber-400 font-semibold uppercase tracking-wider">
+                {passphrase ? '● Key Active (Tap digits or Lock Vault)' : 'Enter PIN or custom passcode'}
+              </span>
+            </div>
+
+            <div className="grid grid-cols-3 gap-2.5 w-full max-w-[220px] mb-2">
+              {['1', '2', '3', '4', '5', '6', '7', '8', '9'].map((num) => (
+                <button
+                  key={num}
+                  type="button"
+                  onClick={() => setTempPassphrase((prev) => prev + num)}
+                  className="w-10 h-10 rounded-full bg-slate-900 hover:bg-slate-800 text-slate-200 text-sm font-semibold flex items-center justify-center border border-slate-800 transition-colors cursor-pointer mx-auto"
+                >
+                  {num}
+                </button>
+              ))}
+
+              <button
+                type="button"
+                onClick={() => {
+                  setTempPassphrase('');
+                  setPassphrase('');
+                }}
+                className="w-10 h-10 rounded-full bg-rose-950/40 hover:bg-rose-900/60 text-rose-400 text-[9px] font-extrabold flex flex-col items-center justify-center border border-rose-800/40 transition-colors cursor-pointer mx-auto"
+                title="Lock Vault & Wipe memory key"
+              >
+                <Lock className="w-3 h-3 mb-0.5" />
+                <span>LOCK</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setTempPassphrase((prev) => prev + '0')}
+                className="w-10 h-10 rounded-full bg-slate-900 hover:bg-slate-800 text-slate-200 text-sm font-semibold flex items-center justify-center border border-slate-800 transition-colors cursor-pointer mx-auto"
+              >
+                0
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setTempPassphrase((prev) => prev.slice(0, -1))}
+                className="w-10 h-10 rounded-full bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-slate-200 text-xs font-semibold flex items-center justify-center border border-slate-800 transition-colors cursor-pointer mx-auto"
+                title="Backspace"
+              >
+                ⌫
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Main Chat Messages Display Area */}
+      <div className="flex-1 overflow-y-auto p-4 space-y-3 scrollbar-thin scrollbar-thumb-slate-800">
+        {messages.length === 0 ? (
+          <div className="h-full flex flex-col items-center justify-center text-center p-6 text-slate-500">
+            <ShieldCheck className="w-12 h-12 mb-3 text-amber-500/40" />
+            <p className="text-sm font-medium text-slate-400">Zero-Knowledge Encrypted Stream</p>
+            <p className="text-xs text-slate-600 max-w-xs mt-1">
+              Messages are encrypted end-to-end on device. Set matching passcodes to decrypt messages.
+            </p>
+          </div>
+        ) : (
+          messages.map((msg) => {
+            const isMe = msg.senderId === currentUser.uid;
+            const decryptedText = decryptedTexts[msg.id];
+            const isDecrypted = Boolean(decryptedText);
+
+            // Calculate Read Receipts: double check if read by all participants (excluding sender)
+            const otherParticipants = chat.participants.filter(pId => pId !== msg.senderId);
+            const readByList = msg.readBy || [];
+            const isReadByAll = otherParticipants.length > 0 && otherParticipants.every(pId => readByList.includes(pId));
+
+            return (
+              <div
+                key={msg.id}
+                className={`flex flex-col ${isMe ? 'items-end' : 'items-start'} group`}
+              >
+                <div
+                  className={`max-w-[85%] sm:max-w-[70%] rounded-2xl p-3.5 relative transition-all shadow-md ${
+                    isMe
+                      ? 'bg-amber-600/90 text-slate-950 font-medium rounded-tr-none border border-amber-500/40'
+                      : 'bg-slate-900 text-slate-100 rounded-tl-none border border-slate-800'
+                  }`}
+                >
+                  {/* Sender Name */}
+                  {!isMe && (
+                    <p className="text-[10px] font-bold text-amber-400 mb-1 font-mono">
+                      {msg.senderName}
+                    </p>
+                  )}
+
+                  {/* Quoted Reply Block */}
+                  {msg.replyTo && (
+                    <div className={`text-[11px] p-2 rounded-lg mb-2 border-l-2 font-mono ${
+                      isMe ? 'bg-amber-700/30 border-slate-950 text-slate-900' : 'bg-slate-950 border-amber-500 text-slate-300'
+                    }`}>
+                      <p className="font-bold text-[10px]">{msg.replyTo.senderName}</p>
+                      <p className="truncate text-[10px]">{msg.replyTo.text}</p>
+                    </div>
+                  )}
+
+                  {/* Image Attachment */}
+                  {msg.imageURL && (
+                    <div className="mb-2 rounded-xl overflow-hidden border border-slate-950/20 max-h-60 bg-black/40">
+                      <img
+                        src={msg.imageURL}
+                        alt="Cypher Attachment"
+                        className="w-full h-full object-cover"
+                        loading="lazy"
+                      />
+                    </div>
+                  )}
+
+                  {/* Message Content */}
+                  <div className="text-xs sm:text-sm leading-relaxed break-words font-sans">
+                    {isDecrypted ? (
+                      <span>{decryptedText}</span>
+                    ) : (
+                      <div className="flex items-center gap-1.5 opacity-80 font-mono text-[11px]">
+                        <Lock className="w-3.5 h-3.5 shrink-0" />
+                        <span className="italic">
+                          {passphrase ? '[Decryption Failed - Wrong Key]' : '[Encrypted Message - Enter Key]'}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Footer Meta: Time, Self-Destruct, Read Receipts */}
+                  <div className={`flex items-center justify-end gap-1.5 mt-2 text-[10px] font-mono ${
+                    isMe ? 'text-slate-950/80' : 'text-slate-500'
+                  }`}>
+                    {msg.ephemeralHours && (
+                      <span className="flex items-center gap-0.5 text-rose-400 font-bold" title="Self-destruct timer enabled">
+                        <Clock className="w-3 h-3" />
+                        <span>{msg.ephemeralHours}h</span>
+                      </span>
+                    )}
+
+                    <span>{formatMessageTime(msg.timestamp)}</span>
+
+                    {/* Read Receipt Double Check Indicator */}
+                    {isMe && (
+                      <span title={isReadByAll ? "Seen by participant(s)" : "Sent (Unread)"}>
+                        {isReadByAll ? (
+                          <CheckCheck className="w-3.5 h-3.5 text-sky-950 font-bold" />
+                        ) : (
+                          <Check className="w-3.5 h-3.5 text-slate-950/70" />
+                        )}
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                {/* Message Quick Action Menu */}
+                <button
+                  type="button"
+                  onClick={() => setReplyingTo({
+                    id: msg.id,
+                    senderName: msg.senderName,
+                    text: isDecrypted ? decryptedText : '[Encrypted Content]'
+                  })}
+                  className="opacity-0 group-hover:opacity-100 transition-opacity text-[10px] text-slate-500 hover:text-amber-400 mt-1 flex items-center gap-1 cursor-pointer"
+                >
+                  <CornerUpLeft className="w-3 h-3" />
+                  <span>Reply</span>
+                </button>
+              </div>
+            );
+          })
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* Typing Indicator Bar */}
+      {typingUsers.length > 0 && (
+        <div className="px-4 py-1 bg-slate-900/40 text-[10px] text-amber-400 font-mono flex items-center gap-1.5">
+          <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-ping" />
+          <span>{typingUsers.join(', ')} {typingUsers.length === 1 ? 'is' : 'are'} typing encrypted cypher...</span>
+        </div>
+      )}
+
+      {/* Error Banner */}
+      {errorMsg && (
+        <div className="px-4 py-2 bg-rose-950/80 border-t border-rose-500/30 text-rose-300 text-xs flex items-center justify-between">
+          <div className="flex items-center gap-1.5">
+            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+            <span>{errorMsg}</span>
+          </div>
+          <button onClick={() => setErrorMsg('')} className="text-rose-400 hover:text-rose-200">
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
+      {/* Quoted Reply Preview Header */}
+      {replyingTo && (
+        <div className="px-4 py-2 bg-slate-900 border-t border-slate-800 flex items-center justify-between text-xs">
+          <div className="flex items-center gap-2 overflow-hidden">
+            <CornerUpLeft className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+            <div className="truncate">
+              <span className="font-semibold text-slate-300">{replyingTo.senderName}: </span>
+              <span className="text-slate-400 italic">{replyingTo.text}</span>
+            </div>
+          </div>
+          <button onClick={() => setReplyingTo(null)} className="text-slate-500 hover:text-slate-200">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {/* Image Attachment Preview Header */}
+      {imagePreview && (
+        <div className="px-4 py-2 bg-slate-900 border-t border-slate-800 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="w-10 h-10 rounded-lg overflow-hidden border border-slate-700 bg-black">
+              <img src={imagePreview} alt="Preview" className="w-full h-full object-cover" />
+            </div>
+            <span className="text-xs text-slate-300 font-medium">Image Attached</span>
+          </div>
+          <button onClick={handleClearImage} className="text-slate-500 hover:text-rose-400">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {/* Message Input Controls Toolbar */}
+      <form onSubmit={handleSendMessage} className="p-3 bg-slate-900/90 border-t border-slate-800 z-10 flex items-center gap-2">
+        {/* Attachment & Ephemeral Controls */}
+        <input
+          type="file"
+          ref={fileInputRef}
+          onChange={handleImageSelect}
+          accept="image/*"
+          className="hidden"
+        />
+
+        <button
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 text-slate-400 hover:text-amber-400 transition-colors cursor-pointer"
+          title="Attach Image"
+        >
+          <ImageIcon className="w-4 h-4" />
+        </button>
+
+        {/* Ephemeral Self-Destruct Timer Toggle */}
+        <button
+          type="button"
+          onClick={() => {
+            const options = [0, 1, 12, 24];
+            const nextIdx = (options.indexOf(ephemeralHours) + 1) % options.length;
+            setEphemeralHours(options[nextIdx]);
+          }}
+          className={`p-2.5 rounded-xl border transition-colors cursor-pointer text-xs font-mono flex items-center gap-1 ${
+            ephemeralHours > 0
+              ? 'bg-rose-950/60 border-rose-500/50 text-rose-300'
+              : 'bg-slate-950 border-slate-800 text-slate-500 hover:text-slate-300'
+          }`}
+          title="Toggle Self-Destruct Timer (0h, 1h, 12h, 24h)"
+        >
+          <Clock className="w-4 h-4" />
+          {ephemeralHours > 0 && <span className="text-[10px] font-bold">{ephemeralHours}h</span>}
+        </button>
+
+        {/* Main Text Input */}
+        <input
+          type="text"
+          value={inputText}
+          onChange={handleInputChange}
+          placeholder={passphrase ? "Type cypher message..." : "Apply Key above to type..."}
+          className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-xs sm:text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-amber-500 transition-colors"
+        />
+
+        {/* Send Button */}
+        <button
+          type="submit"
+          disabled={isSending || (!inputText.trim() && !selectedImage)}
+          className="p-2.5 bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 rounded-xl transition-colors cursor-pointer font-bold shrink-0 shadow-lg shadow-amber-500/20"
+        >
+          {isSending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+        </button>
+      </form>
+    </div>
+  );
+  }import { encryptMessage, decryptMessage, EncryptedPayload } from '../lib/crypto';
 import { processImageFile } from '../lib/imageUtils';
 import { formatMessageTime, formatRelativeTime } from '../lib/dateUtils';
 import { ChatRoom, ChatMessage, UserProfile } from '../types';
