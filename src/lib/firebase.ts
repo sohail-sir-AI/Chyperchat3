@@ -17,53 +17,36 @@ export const firebaseConfig = {
 
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
-
-// Initialize Auth
-export const auth = getAuth(app);
-export const googleProvider = new GoogleAuthProvider();
-
-// Custom database ID setup
 export const db = initializeFirestore(app, {
   localCache: persistentLocalCache({
     tabManager: persistentMultipleTabManager()
   })
-}, firebaseConfig.firestoreDatabaseId || '(default)');
+}, firebaseConfig.firestoreDatabaseId);
+export const auth = getAuth(app);
+export const googleProvider = new GoogleAuthProvider();
 
-// Helper functions for Auth
-export const signInWithGoogle = async () => {
-  try {
-    const result = await signInWithPopup(auth, googleProvider);
-    return result.user;
-  } catch (error) {
-    console.error('Error signing in with Google:', error);
-    throw error;
-  }
-};
+// Error Handling Infrastructure conforming to FirestoreErrorInfo
+export enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
 
-export const logoutUser = async () => {
-  try {
-    await signOut(auth);
-  } catch (error) {
-    console.error('Error signing out:', error);
-    throw error;
-  }
-};
-
-// Network status verification
-export const checkFirestoreConnectivity = async () => {
-  try {
-    // Attempt a lightweight server fetch to verify connection
-    const testRef = doc(db, '_healthcheck', 'ping');
-    await getDocFromServer(testRef);
-    return true;
-  } catch (error: any) {
-    if (error?.code === 'unavailable' || error?.message?.includes('offline')) {
-      return false;
-    }
-    // Other errors (like permission denied) still mean network is reachable
-    return true;
-  }
-};      providerId?: string | null;
+export interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
       email?: string | null;
     }[];
   };
@@ -110,7 +93,7 @@ export async function testConnection() {
   }
 }
 
-// Authentication Helpers
+// Authentication Helper
 export async function signInWithGoogle() {
   try {
     const result = await signInWithPopup(auth, googleProvider);
